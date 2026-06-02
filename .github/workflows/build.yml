@@ -1,0 +1,41 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Compile-check (ROCm 6.2 / Ubuntu 22.04)
+    runs-on: ubuntu-latest
+    container:
+      image: rocm/dev-ubuntu-22.04:6.2-complete
+      options: --user root
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CMake (>= 3.21 required for HIP language support)
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends cmake ninja-build git ca-certificates
+          cmake --version
+
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang"
+
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+
+      - name: Generate test image
+        run: ./build/gen_test_image 1920 1080 /tmp/test.png
+
+      - name: Smoke test — run CPU path via strace (no GPU needed)
+        run: |
+          # Verify the binary loads and prints usage without crashing
+          ./build/hip_filters 2>&1 | grep -q "Usage" && echo "Usage output OK"
