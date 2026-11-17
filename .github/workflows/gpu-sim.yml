@@ -1,0 +1,87 @@
+name: GPU Simulator
+
+# Builds the HIP filters for gfx942 and runs them on a simulated AMD Instinct
+# MI300X (https://github.com/pantheongpu/pantheonsim). tests/check_filters.cpp
+# compares every GPU filter with its CPU reference on a small image. The
+# simulator has no timing model, so this checks results only, not speed.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "src/**"
+      - "include/**"
+      - "tests/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  filters:
+    name: GPU vs CPU filters (ROCm 7.1 and simulated MI300X)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Set up the simulated GPU and ROCm
+        uses: pantheongpu/setup-pantheonsim@deff5781e8adfd83dec98dd5242dcbc96a564773 # v0.1.10
+        with:
+          gpu: amd/mi300x
+          cuda-toolkit: none
+          rocm: "7.1"
+
+      # find_package(hip) needs the amd_comgr and HSA runtime libraries, which
+      # the action does not install.
+      - name: Install comgr and hsa-rocr
+        run: sudo apt-get install -y comgr hsa-rocr
+
+      # The ROCm clang is the C++ compiler too, because hip::device passes
+      # --offload-arch to every target that links it.
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH=/opt/rocm \
+            -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
+            -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ \
+            -DCMAKE_HIP_ARCHITECTURES=gfx942
+
+      - name: Build
+        run: |
+          cmake --build build --parallel 3
+          hipcc -O2 --offload-arch=gfx942 -I include tests/check_filters.cpp \
+            -Lbuild -lfilters -o build/check_filters
+
+      - name: Compare GPU filters with the CPU reference
+        run: |
+          vgpu run ./build/check_filters 2>&1 | tee check.log
+          test "${PIPESTATUS[0]}" -eq 0
+          # all five comparisons must have run, none skipped
+          test "$(grep -c ': ok$' check.log)" -eq 5
+          grep -q 'all filters match' check.log
+          if grep -Eqi 'VirtualGPU error|no HIP device|no device|FAIL' check.log; then
+            echo "simulator or filter error in the log"; exit 1
+          fi
+
+      - name: CLI smoke test
+        run: |
+          ./build/gen_test_image 64 48 in.png
+          vgpu run ./build/hip_filters blur in.png out.png 2.0 3 2>&1 | tee cli.log
+          grep -q '^Saved: out.png' cli.log
+          test -s out.png
+          if grep -Eqi 'VirtualGPU error|no device' cli.log; then exit 1; fi
